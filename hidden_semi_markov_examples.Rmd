@@ -1,0 +1,526 @@
+---
+title: "Using hidden semi-Markov models for modeling the menstrual cycle"
+author: "Laura Symul"
+date: "Feb 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+First, we need to install and load a few libraries from CRAN.
+
+```{r install-libraries, eval = FALSE}
+install.packages("tidyverse")
+install.packages("devtools") # the devtools package does a lot of things. 
+# here we'll use it to load the HiddenSemiMarkov package from github
+```
+
+
+Then, we will also download the package I developed for hidden semi-Markov models for multivariate time-series with informative missing data.
+
+```{r HiddenSemiMarkov-install-package, eval = FALSE}
+
+devtools::install_github(repo = "lasy/HiddenSemiMarkov") # this is still work in progress, so let me know if you experience any issue with the package.
+
+```
+
+
+```{r load-libraries}
+
+library(tidyverse)
+library(HiddenSemiMarkov)
+
+```
+
+
+# Model 1: a simple model of menses
+
+We start with the simplest model: a two-state model for univariate time-series of bleeding reports. The first state is the menses state and the second state is the cycle state.
+
+In the menses state, bleeding is very likely, in the cycle state, bleeding is unlikely.
+
+The menses state is expected to last ~ 3-5 days, the cycle state is expected to last ~ 23-33 days.
+
+```{r m1-specification}
+
+m1 = specify_hsmm(
+  J = 2, # the number of state
+  state_names = c("M","C"), # the name of the states (optional)
+  state_colors = c("red", "steelblue"), # colors associated with each state (optional)
+  init = c(1,0), # the initial probabilities. We set them up so that our time series always start with the menses state.
+  transition = matrix(c(0,1,1,0), 2,2), # since we have only state, we can only transition from one to the next
+  sojourn = list( # the distribution of duration of each state
+    M = list(type = "nonparametric",
+             d = c(0,dnorm(2:10, mean = 4, sd = 1.5))), # the menses state last about 4 days
+    C = list(type = "nonparametric",
+             d = c(rep(0,19), dnorm(20:45, mean = 28-4, sd = 3))) # the cycle state last about 28-4 = 24 days
+  ),
+  marg_em_probs = # marginal emission probabilities
+    list(
+      bleeding = 
+        list(type = "non-par",
+             params = list(
+               values = c("no bleeding", "bleeding"),
+               probs = bind_cols(
+                 c(0.03, 0.97), # bleeding is very likely during the menses 
+                 c(0.95, 0.05)) # bleeding is quite unlikely outside of the menses
+             ),
+             viz_options = list(colors = c("gray80","tomato"))) # we can specify colors for each value of a variable
+    )
+)
+
+```
+
+We can visualize some properties of our model such as the sojourn distributions
+
+```{r m1-sojourn-viz}
+
+plot_hsmm_sojourn_dist(model = m1, maxt = 100)
+
+```
+
+or the emission distributions
+
+```{r m1-emission-viz}
+
+plot_hsmm_marg_dist(model = m1)
+
+```
+
+And we can simulate time-series with this model:
+
+```{r m1-simulation}
+
+X = simulate_hsmm(model = m1, n_state_transitions = 20) # we simulate 10 cycles (20 = 10*2)
+dim(X)
+head(X)
+
+```
+
+and visualize the sequence we just simulated:
+
+```{r m1-simulation-viz, fig.width=10, fig.height=3}
+
+plot_hsmm_seq(X = X, model = m1)
+
+```
+
+Finally, we can check that we are able to decode our sequence of observations and retrieve the "ground truth", i.e. the simulated sequence of state.
+
+```{r m1-decoding, fig.width=10, fig.height=4}
+
+# first, we duplicate our simulated sequence but remove the ground truth (this is not strictly necessary, but I hope it will convince you more of what the predict_hsmm function does :))
+
+X_no_gt = X %>% select(-state)
+
+fwbw_res = predict_states_hsmm(model = m1, X = X_no_gt, method = "FwBw")
+
+names(fwbw_res) # the predicted sequence is in "state_seq"
+
+head(fwbw_res$state_seq)
+
+X_with_fwbw_res = 
+  X %>% 
+  rename(state_ground_truth = state) %>% 
+  left_join(.,
+            fwbw_res$state_seq %>% 
+              rename(state_predicted_by_fwbw = state,
+                     state_prob_predicted_by_fwbw = likelihood),
+            by = c("seq_id","t"))
+
+head(X_with_fwbw_res)
+
+plot_hsmm_seq(X_with_fwbw_res, model = m1)
+
+```
+
+
+
+# Model 2: adding missing data probabilities.
+
+Now, it is really unlikely that an app user would report no bleeding. It is more likely that a user would not report anything at all when they don't have their period.
+
+That means, that the actual observations are more likely to have a lot of missing data when there is no bleeding
+
+```{r modifying-simulated-observations-from-m1, fig.height=3, fig.width=10}
+
+X_more_realistic = 
+  X %>% 
+  mutate(bleeding = ifelse((bleeding == "no bleeding") & (runif(nrow(X))> 0.2), NA, bleeding))
+  
+
+plot_hsmm_seq(X = X, model = m1)
+plot_hsmm_seq(X = X_more_realistic, model = m1)
+
+```
+
+Now, if we try to decode that "more realistic" time-series with our model, this is how it's going to perform:
+
+```{r m1-realistic-decoding, fig.height= 4, fig.width=10}
+
+fwbw_res = predict_states_hsmm(model = m1, X = X_more_realistic, method = "FwBw")
+
+X_more_realistic_with_FwBw = 
+  X_more_realistic %>% 
+  rename(state_ground_truth = state) %>% 
+  left_join(.,
+            fwbw_res$state_seq %>% 
+              rename(state_predicted_by_fwbw = state,
+                     state_prob_predicted_by_fwbw = likelihood),
+            by = c("seq_id","t"))
+
+
+
+plot_hsmm_seq(X_more_realistic_with_FwBw, model = m1)
+
+```
+
+In comparison, we now have more decoding errors than when we had no missing data.
+
+```{r m1-realistic-decoding-comparison, fig.height= 4, fig.width=10}
+
+plot_hsmm_seq(X_with_fwbw_res, model = m1)
+
+```
+So, we want to inform the model that missing data is more likely in the state "cycle"
+
+Let's specify the same model but add this prior information that we have about missingness:
+
+```{r m2-specification}
+
+m2 = specify_hsmm(
+  J = m1$J, 
+  state_names = m1$state_names, 
+  state_colors = m1$state_colors, 
+  init = m1$init, 
+  transition = m1$transition, 
+  sojourn = m1$sojourn,
+  marg_em_probs = m1$marg_em_probs,
+  censoring_probs = 
+    list(p = c(0,0.8))
+)
+
+```
+
+We can compare the marginal emission probabilities of m1 and m2.
+
+
+```{r m2-marginal-probs-viz}
+
+plot_hsmm_marg_dist(model = m1) + ggtitle("m1")
+plot_hsmm_marg_dist(model = m2) + ggtitle("m2")
+
+```
+
+
+Now, if we decode our "realistic sequence" with this new model, do we get less decoding errors?
+
+```{r m2-realistic-decoding, fig.height= 4, fig.width=10}
+
+fwbw_res_m2 = predict_states_hsmm(model = m2, X = X_more_realistic, method = "FwBw")
+
+X_more_realistic_with_FwBw_m2 = 
+  X_more_realistic %>% 
+  rename(state_ground_truth = state) %>% 
+  left_join(.,
+            fwbw_res_m2$state_seq %>% 
+              rename(state_predicted_by_fwbw = state,
+                     state_prob_predicted_by_fwbw = likelihood),
+            by = c("seq_id","t"))
+
+
+
+plot_hsmm_seq(X_more_realistic_with_FwBw_m2, model = m2)
+
+```
+Yes we do! Success!
+
+Obviously, this was a very very very simple example. We could have just imputed missing data to be "no bleeding" in this case and have solved our problem. But in more complex models for multivariate time-series, imputing might not be possible or may completely bias the results. So, at least, now you know that you can model state-dependent missingness.
+
+# Model 3: adding ovulation test results
+
+Let's take on the next challenge of adding ovulation to our cycle model.
+
+Again, we'll completely simplify the biology and assume that ovulation kits give a positive test 90%  of the time on the day of ovulation (true positive rate) and 2% of the time outside of that (false positive rate). In reality, ovulation tests are actually LH test. LH surges before ovulation, so the likelihood of a positive test increases before ovulation, but "it's complicated" because LH surges in successive peaks of increasing intensity. So, if someone tests just after one of the smaller peak, they may have positive tests before the day of ovulation. Also, LH may take a while to disappear, so they make have positive results after as well. And finally, some conditions, such as PCOS, completely mess up with the FSH and LH levels and people with this condition may constantly test positive.
+
+But for now, let's take the simplest assumption, as stated above.
+
+That means that instead of 2 states, we'll have 4 states: the menses, followed by the follicular phase (pre-ovulation), ovulation day, and finally, the luteal phase (post ovulation).
+
+Now, we also know that the luteal phase is a lot more stable in duration than the follicular phase.
+The luteal phase is approximately 13 days. Most of the variability in cycle length comes from the follicular phase.
+
+Let's specify this new 4-state 2-variable model:
+
+```{r m3-specification}
+
+m3 = 
+  specify_hsmm(
+    J = 4,
+    state_names = c("M","f","O","l"),
+    state_colors = c("red","steelblue1","black","goldenrod2"),
+    init = c(1,0,0,0),
+    transition = rbind(c(0,1,0,0),
+                       c(0,0,1,0),
+                       c(0,0,0,1),
+                       c(1,0,0,0)), # we specify a cyclic model
+    sojourn =
+      list(
+        M = 
+          list(type = "ksmoothed_nonparametric", bw = 2,
+             d = c(0,dnorm(2:10, mean = 4, sd = 1.5))),
+        f = 
+          list(type = "ksmoothed_nonparametric", bw = 2,
+               d = c(rep(0,9), dnorm(10:22, mean = 14, sd = 3))),
+        O = 
+          list(type = "ksmoothed_nonparametric", bw = 2,
+               d = c(1)), # ovulation state lasts exactly 1 day
+        l = 
+          list(type = "ksmoothed_nonparametric", bw = 2,
+               d = c(rep(0,6), dnorm(7:16, mean = 14, sd = 1))) # similar to the follicular phase but with a much smaller variance
+      ),
+    
+  marg_em_probs = # marginal emission probabilities
+    list(
+      bleeding = 
+        list(type = "non-par",
+             params = list(
+               values = c("no bleeding", "spotting","bleeding"), # let's add a layer of realism by adding a level to the possible values of bleeding (spotting)
+                probs = bind_cols(
+                 c(0.01, 0.02, 0.97), # M: bleeding is very likely during the menses 
+                 c(0.99, 0.01, 0), # f: bleeding is quite unlikely before ovulation
+                 c(0.6, 0.4, 0), # O: spotting may happen at ovulation
+                 c(0.9, 0.1, 0) # l: spotting may also happen more frequently in the luteal phase than in the follicular phase
+                 ) 
+             ),
+             viz_options = 
+               list(colors = c("gray80","salmon1","tomato")) # we can specify colors for each value of a variable
+             ), 
+      LH.test = 
+        list(
+          type = "non-par",
+          params = list(
+            values = c("positive","negative"),
+            probs = bind_cols(
+              c(0.02,0.98),
+              c(0.02,0.98),
+              c(0.9, 0.1), # our true positive rate is 90%
+              c(0.02,0.98)
+            ),
+            viz_options = 
+              list(colors = c("green3","gray70"))
+          )
+        )
+    ),
+  censoring_probs = 
+    list(
+      p = c(0, 0.5, 0.4, 0.5), # the ps are the missing probabilities for all variables
+      q = rbind( # the qs are the marginal missing probability for each variable
+        c(0.1, 0.8, 0.8, 0.8), # that's interpreted as, conditioned on the user opening the app in that state, the variable "bleeding" has a 10% chance to be missing during menses, and 80% chance to be missing in the other states
+        c(1, 0.5, 0.5, 0.5)  # that's interpreted as, conditioned on the user opening the app in that state, the variable "LH.test" has a 100% chance to be missing during menses, and 50% chance to be missing in the other states.
+      )
+    )
+  )
+
+```
+
+
+Let's visualize our model.
+
+
+First, let's take a look at the model graph (to make sure that we implemented transitions properly)
+
+```{r m3-graph}
+
+plot_hsmm_transitions(model = m3)
+
+```
+
+Then, let's check our sojourn distributions
+
+```{r m3-sojourns}
+
+plot_hsmm_sojourn_dist(model = m3, maxt = 30)
+
+```
+
+And our marginal emissions.
+
+```{r m3-marg-dist}
+
+plot_hsmm_marg_dist(model = m3)
+
+```
+
+Everything looks okay, let's simulate a sequence.
+
+```{r m3-simulation, fig.width=10, fig.height=4}
+
+X = simulate_hsmm(model = m3, n_state_transitions = 4*10)
+
+plot_hsmm_seq(X = X, model = m3)
+
+```
+And make sure that we can decode it:
+
+```{r m3-decoding, fig.width=10, fig.height=5}
+
+fwbw_res = predict_states_hsmm(model = m3, X = X, method = "FwBw")
+
+
+X_with_fwbw_res = 
+  X %>% 
+  rename(state_ground_truth = state) %>% 
+  left_join(.,
+            fwbw_res$state_seq %>% 
+              rename(state_predicted_by_fwbw = state,
+                     state_prob_predicted_by_fwbw = likelihood),
+            by = c("seq_id","t"))
+
+head(X_with_fwbw_res)
+
+plot_hsmm_seq(X_with_fwbw_res, model = m3)
+
+
+```
+
+
+We observe that we have more decoding errors around ovulation. That's because of the amount of missing data. Because only occasional spotting or occasionally reported positive LH tests is informative of ovulation, it's difficult to estimate it's timing in the absence of these variables.
+
+
+# Fitting a model to a person's timeline
+
+So far, we've created models describing the biology of the general population. But we can also use these models to learn menstrual cycle characteristics of individuals.
+
+For example, let's take Alex and Blake. They both have very different menstrual cycle characteristics: Alex has irregular cycles because ovulation is often delayed because of high stress, while Blake has more regular cycles but a very short luteal phase because the ovaries do not release enough progesterone to sustain it. 
+
+Let's see if we can fit our general model to retrieve the menstrual cycle characteristics of Alex and Blake.
+
+```{r Alex}
+
+# first, we specify a model to simulate Alex's sequence:
+
+m_Alex = 
+  specify_hsmm(
+    J = m3$J,
+    state_names = m3$state_names,
+    state_colors = m3$state_colors,
+    init = m3$init,
+    transition = m3$transition,
+    sojourn = 
+      list(
+        M = m3$sojourn$M,
+        f = list(
+          type = "ksmoothed_nonparametric", bw = 2,
+          d = c(rep(0,9), dnorm(10:22, mean = 17, sd = 10))
+        ),
+        O = m3$sojourn$O,
+        l = m3$sojourn$l
+      ),
+    marg_em_probs = m3$marg_em_probs,
+    censoring_probs = 
+    list(
+      p = c(0,0.1,0.1,0.1), 
+      q = rbind(
+        c(0.1, 0.8, 0.8, 0.8),
+        c(1, 0.3, 0.3, 0.3)  
+      )
+    )
+  )
+  
+
+```
+
+
+
+```{r Blake}
+
+# And a model for Blake
+
+m_Blake = 
+  specify_hsmm(
+    J = m3$J,
+    state_names = m3$state_names,
+    state_colors = m3$state_colors,
+    init = m3$init,
+    transition = m3$transition,
+    sojourn = 
+      list(
+        M = m3$sojourn$M,
+        f = m3$sojourn$f,
+        O = m3$sojourn$O,
+        l = list(
+          type = "ksmoothed_nonparametric", bw = 2,
+          d = c(rep(0,5), dnorm(6:12, mean = 8, sd = 1))
+        )
+      ),
+    marg_em_probs = m3$marg_em_probs,
+    censoring_probs = 
+    list(
+      p = c(0,0.1,0.1,0.1), 
+      q = rbind(
+        c(0.1, 0.8, 0.8, 0.8),
+        c(1, 0.3, 0.3, 0.3)  
+      )
+    )
+  )
+  
+
+```
+
+We simulate sequences of 4 cycles for both individual - like if they had been instructed to monitor their ovulation for four cycle by an OBGYN.
+
+```{r Alex-Blake-simulations, fig.height=4, fig.width=10}
+
+set.seed(4)
+X_Alex = simulate_hsmm(model = m_Alex, n_state_transitions = 4*4)
+X_Blake = simulate_hsmm(model = m_Blake, n_state_transitions = 4*4)
+
+plot_hsmm_seq(X = X_Alex, model = m3, title = "Alex")
+plot_hsmm_seq(X = X_Blake, model = m3, title = "Blake")
+
+
+```
+
+Now, we will fit our generic model (m3) separately to each sequence and see if we have learned the menstrual cycle characteristics of Alex and Blake
+
+```{r fitting}
+
+fit_Alex = fit_hsmm(model = m3, X = X_Alex)
+fit_Blake = fit_hsmm(model = m3, X = X_Blake)
+
+```
+
+We check the convergence of the fit (the fit is actually an EM)
+
+```{r fit-convergence}
+
+plot_hsmm_fit_status(fit_output = fit_Alex)
+plot_hsmm_fit_status(fit_output = fit_Blake)
+
+```
+
+
+And now, we look at the learned sojourns
+
+```{r fit-sojourn}
+
+plot_hsmm_sojourn_dist(model = m3, maxt = 50) + ggtitle("general model")
+plot_hsmm_sojourn_dist(model = fit_Alex$model, maxt = 50) + ggtitle("Alex")
+plot_hsmm_sojourn_dist(model = fit_Blake$model, maxt = 50) + ggtitle("Blake")
+
+
+```
+
+
+We see that the model fitted on Alex's data has a much wider distribution for the follicular phase and that the model fitted on Blake's data has a distribution of luteal phase shifted towards smaller values.
+
+
+# Model 4: adding pregnancies
+
+I leave this one for your as an exercise.
+Feel free to send me questions or proposed models at lsymul@stanford.edu.
+
